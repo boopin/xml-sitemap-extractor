@@ -114,11 +114,8 @@ def main():
                     if not df.empty:
                         st.markdown(f"<p class='url-count'>📊 Found {len(df):,} URLs!</p>", unsafe_allow_html=True)
                         
-                        # Show dataframe with styling
-                        st.dataframe(
-                            df.style.highlight_null(null_color='#ffecb3'),
-                            height=400
-                        )
+                        # Show dataframe with simple display
+                        st.dataframe(df, height=400)
                         
                         # Export options in columns
                         col1, col2 = st.columns(2)
