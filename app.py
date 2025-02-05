@@ -3,15 +3,17 @@ import requests
 import xml.etree.ElementTree as ET
 import pandas as pd
 from io import BytesIO
+import concurrent.futures
+import time
 
-# Page config for tab name and favicon
+# Page config
 st.set_page_config(
     page_title="SitemapSage",
     page_icon="🗺️",
     layout="wide"
 )
 
-# Custom CSS for styling
+# Custom CSS
 st.markdown("""
     <style>
     .main-header {
@@ -36,37 +38,49 @@ st.markdown("""
         font-weight: bold;
         text-align: center;
     }
+    .processing-status {
+        margin: 10px 0;
+        padding: 10px;
+        border-radius: 5px;
+    }
+    .success {
+        background-color: #E8F5E9;
+        color: #2E7D32;
+    }
+    .error {
+        background-color: #FFEBEE;
+        color: #C62828;
+    }
     </style>
     """, unsafe_allow_html=True)
 
 def extract_urls_from_sitemap(sitemap_url):
     try:
-        # Fetch the sitemap
-        response = requests.get(sitemap_url)
+        response = requests.get(sitemap_url, timeout=10)
         response.raise_for_status()
         
-        # Parse XML
         root = ET.fromstring(response.content)
-        
-        # Handle different sitemap namespaces
         namespaces = {
             'ns': 'http://www.sitemaps.org/schemas/sitemap/0.9',
             'xhtml': 'http://www.w3.org/1999/xhtml'
         }
         
-        # Extract URLs
         urls = []
         last_modified = []
         change_freq = []
         priority = []
+        source_sitemap = []
         
-        # Check if it's a sitemap index
         if 'sitemapindex' in root.tag:
             for sitemap in root.findall('.//ns:loc', namespaces):
-                sub_urls = extract_urls_from_sitemap(sitemap.text)
-                urls.extend(sub_urls)
+                sub_df = extract_urls_from_sitemap(sitemap.text)
+                if not sub_df.empty:
+                    urls.extend(sub_df['URL'].tolist())
+                    last_modified.extend(sub_df['Last Modified'].tolist())
+                    change_freq.extend(sub_df['Change Frequency'].tolist())
+                    priority.extend(sub_df['Priority'].tolist())
+                    source_sitemap.extend([sitemap_url] * len(sub_df))
         else:
-            # Regular sitemap
             for url in root.findall('.//ns:url', namespaces):
                 loc = url.find('ns:loc', namespaces)
                 if loc is not None:
@@ -78,72 +92,140 @@ def extract_urls_from_sitemap(sitemap_url):
                     last_modified.append(lastmod.text if lastmod is not None else None)
                     change_freq.append(changefreq.text if changefreq is not None else None)
                     priority.append(pri.text if pri is not None else None)
+                    source_sitemap.append(sitemap_url)
         
         return pd.DataFrame({
             'URL': urls,
             'Last Modified': last_modified,
             'Change Frequency': change_freq,
-            'Priority': priority
+            'Priority': priority,
+            'Source Sitemap': source_sitemap
         })
     
     except Exception as e:
-        st.error(f"Error processing sitemap: {str(e)}")
+        st.error(f"Error processing {sitemap_url}: {str(e)}")
         return pd.DataFrame()
 
+def process_sitemap(url):
+    start_time = time.time()
+    df = extract_urls_from_sitemap(url)
+    processing_time = time.time() - start_time
+    return {
+        'url': url,
+        'df': df,
+        'processing_time': processing_time,
+        'success': not df.empty
+    }
+
 def main():
-    # Header
     st.markdown("<h1 class='main-header'>🗺️ SitemapSage</h1>", unsafe_allow_html=True)
-    st.markdown("<p class='subheader'>Extract, analyze, and export URLs from any XML sitemap</p>", unsafe_allow_html=True)
+    st.markdown("<p class='subheader'>Batch Process Multiple XML Sitemaps</p>", unsafe_allow_html=True)
     
-    # Create three columns for better layout
-    left_col, main_col, right_col = st.columns([1, 2, 1])
+    # Input method selector
+    input_method = st.radio(
+        "Choose input method:",
+        ["Single URL", "Multiple URLs", "Upload File"]
+    )
     
-    with main_col:
-        # Input field with example
-        sitemap_url = st.text_input(
-            "Enter XML Sitemap URL:",
-            placeholder="https://example.com/sitemap.xml"
+    sitemap_urls = []
+    
+    if input_method == "Single URL":
+        url = st.text_input("Enter XML Sitemap URL:", placeholder="https://example.com/sitemap.xml")
+        if url:
+            sitemap_urls = [url]
+    
+    elif input_method == "Multiple URLs":
+        urls_text = st.text_area(
+            "Enter multiple sitemap URLs (one per line):",
+            placeholder="https://example1.com/sitemap.xml\nhttps://example2.com/sitemap.xml"
         )
-        
-        # Process button
-        if st.button("🔍 Extract URLs", use_container_width=True):
-            if sitemap_url:
-                with st.spinner("🔄 Processing sitemap..."):
-                    df = extract_urls_from_sitemap(sitemap_url)
+        if urls_text:
+            sitemap_urls = [url.strip() for url in urls_text.split('\n') if url.strip()]
+    
+    else:  # Upload File
+        uploaded_file = st.file_uploader("Upload a text file with sitemap URLs (one per line)", type=['txt'])
+        if uploaded_file:
+            content = uploaded_file.getvalue().decode()
+            sitemap_urls = [url.strip() for url in content.split('\n') if url.strip()]
+    
+    # Process button
+    if st.button("🔍 Process Sitemaps", use_container_width=True):
+        if sitemap_urls:
+            progress_bar = st.progress(0)
+            status_container = st.empty()
+            
+            # Initialize results storage
+            all_results = pd.DataFrame()
+            total_urls = 0
+            successful_sitemaps = 0
+            failed_sitemaps = 0
+            
+            # Process sitemaps with concurrent execution
+            with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
+                futures = {executor.submit(process_sitemap, url): url for url in sitemap_urls}
+                
+                for i, future in enumerate(concurrent.futures.as_completed(futures)):
+                    result = future.result()
+                    progress = (i + 1) / len(sitemap_urls)
+                    progress_bar.progress(progress)
                     
-                    if not df.empty:
-                        st.markdown(f"<p class='url-count'>📊 Found {len(df):,} URLs!</p>", unsafe_allow_html=True)
-                        
-                        # Show dataframe with simple display
-                        st.dataframe(df, height=400)
-                        
-                        # Export options in columns
-                        col1, col2 = st.columns(2)
-                        
-                        # CSV export
-                        csv = df.to_csv(index=False).encode('utf-8')
-                        col1.download_button(
-                            label="📥 Download CSV",
-                            data=csv,
-                            file_name="sitemap_urls.csv",
-                            mime="text/csv",
-                            use_container_width=True
-                        )
-                        
-                        # Excel export
-                        buffer = BytesIO()
-                        with pd.ExcelWriter(buffer, engine='xlsxwriter') as writer:
-                            df.to_excel(writer, index=False, sheet_name='URLs')
-                        excel_data = buffer.getvalue()
-                        col2.download_button(
-                            label="📊 Download Excel",
-                            data=excel_data,
-                            file_name="sitemap_urls.xlsx",
-                            mime="application/vnd.ms-excel",
-                            use_container_width=True
-                        )
-            else:
-                st.warning("⚠️ Please enter a sitemap URL")
+                    if result['success']:
+                        successful_sitemaps += 1
+                        total_urls += len(result['df'])
+                        all_results = pd.concat([all_results, result['df']], ignore_index=True)
+                        status_text = f"✅ Processed {result['url']} ({len(result['df'])} URLs, {result['processing_time']:.2f}s)"
+                    else:
+                        failed_sitemaps += 1
+                        status_text = f"❌ Failed to process {result['url']}"
+                    
+                    status_container.markdown(f"<div class='processing-status {'success' if result['success'] else 'error'}'>{status_text}</div>", unsafe_allow_html=True)
+            
+            # Display results
+            if not all_results.empty:
+                st.markdown(f"<p class='url-count'>📊 Processed {successful_sitemaps:,} sitemaps ({failed_sitemaps} failed)<br>Found {total_urls:,} unique URLs!</p>", unsafe_allow_html=True)
+                
+                # Show results grouped by sitemap
+                st.subheader("Results by Sitemap")
+                sitemap_stats = all_results.groupby('Source Sitemap').agg({
+                    'URL': 'count',
+                    'Last Modified': lambda x: x.notna().sum(),
+                    'Priority': lambda x: x.notna().mean() * 100
+                }).reset_index()
+                sitemap_stats.columns = ['Sitemap', 'URLs Found', 'URLs with Last Modified', '% URLs with Priority']
+                st.dataframe(sitemap_stats)
+                
+                # Show all URLs
+                st.subheader("All URLs")
+                st.dataframe(all_results, height=400)
+                
+                # Export options
+                col1, col2 = st.columns(2)
+                
+                # CSV export
+                csv = all_results.to_csv(index=False).encode('utf-8')
+                col1.download_button(
+                    label="📥 Download CSV",
+                    data=csv,
+                    file_name="sitemap_urls.csv",
+                    mime="text/csv",
+                    use_container_width=True
+                )
+                
+                # Excel export
+                buffer = BytesIO()
+                with pd.ExcelWriter(buffer, engine='xlsxwriter') as writer:
+                    all_results.to_excel(writer, index=False, sheet_name='URLs')
+                    sitemap_stats.to_excel(writer, index=False, sheet_name='Sitemap Stats')
+                excel_data = buffer.getvalue()
+                col2.download_button(
+                    label="📊 Download Excel",
+                    data=excel_data,
+                    file_name="sitemap_urls.xlsx",
+                    mime="application/vnd.ms-excel",
+                    use_container_width=True
+                )
+        else:
+            st.warning("⚠️ Please provide at least one sitemap URL")
     
     # Footer
     st.markdown("---")
